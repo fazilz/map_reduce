@@ -7,7 +7,7 @@ package main
 //
 
 import "fmt"
-import "6.824/mr"
+import "map_reduce/mr"
 import "plugin"
 import "os"
 import "log"
