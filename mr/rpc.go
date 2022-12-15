@@ -22,8 +22,33 @@ type ExampleReply struct {
 	Y int
 }
 
-// Add your RPC definitions here.
+const (
+	WORKER_READY string = "ready"
+	WORKER_BUSY  string = "busy"
+)
 
+// register worker
+type RegisterWorker struct {
+	State string
+}
+
+type RegisterWorkerReply struct {
+	WorkerId string
+}
+
+// worker state (basically heartbeat)
+type HeartBeat struct {
+	WorkerId string
+	State    string
+}
+
+type HeartBeatReply struct {
+	ShouldTerminate bool // if true then filenames is ignored
+	IsMap           bool // map or reduce.
+	Filename        string
+	MaxReduceId     int // needed in map to know which reduce file to write to
+	ReduceId        int
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
