@@ -8,7 +8,9 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -18,6 +20,14 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 type WorkerState struct {
 	sync.Mutex
@@ -38,26 +48,26 @@ func ihash(key string) int {
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	worker := WorkerState{id: register(), state: WORKER_READY}
+	registerWorker := register()
+	worker := WorkerState{id: registerWorker.WorkerId, maxReduceId: registerWorker.MaxReduceId, state: WORKER_READY}
 	for {
 		reply := worker.heartBeat()
-		worker.maxReduceId = reply.MaxReduceId
-		log.Println(worker.id, reply)
 		if reply.ShouldTerminate {
-			fmt.Printf("worker %v exiting\n", worker.id)
+			//log.Printf("worker %v exiting\n", worker.id)
 			break
 		} else if reply.IsMap {
 			go worker.mapcall(reply.Filename, mapf)
-		} else {
+		} else if reply.IsReduce {
 			go worker.reduce(reply.ReduceId, reducef)
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	return
 }
 
 func (w *WorkerState) mapcall(filename string, mapf func(string, string) []KeyValue) {
-	w.workerBusy()
+	w.busy(WORKER_MAP)
+
+	//log.Printf("WORKER: starting MAP on %s", filename)
 
 	file, err := os.Open(filename)
 	if err != nil {
@@ -71,81 +81,96 @@ func (w *WorkerState) mapcall(filename string, mapf func(string, string) []KeyVa
 	file.Close()
 
 	workerMap := make(map[int][]KeyValue)
-	scontent := string(content)
-	kva := mapf(filename, scontent)
+	kva := mapf(filename, string(content))
+	//log.Printf("total key value pairs %d", len(kva))
+	sort.Sort(ByKey(kva))
 	for _, kv := range kva {
 		reduceId := ihash(kv.Key) % w.maxReduceId
 		workerMap[reduceId] = append(workerMap[reduceId], kv)
 	}
 
 	for reduceId, kvs := range workerMap {
-        mrout := "mr-" + w.id + "-" + strconv.Itoa(reduceId)
-		ofile, _ := os.Create(mrout)
+		//log.Printf("total kvs pairs %d for reduceId %d", len(kvs), reduceId)
+		mrout := "mr-" + w.id + "-" + strconv.Itoa(reduceId) + ".json"
+		ofile, _ := os.OpenFile(mrout, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		enc := json.NewEncoder(ofile)
-		for _, kv := range kvs {
-			err := enc.Encode(&kv)
-			if err != nil {
-				log.Fatalf("cannot enocode json in map function, %v", err)
-			}
-		}
-        log.Println(ofile.Stat())
+		enc.Encode(&kvs)
 		ofile.Close()
 	}
-	w.workerReady()
+	taskDone := TaskDone{w.id, WORKER_MAP}
+	call("Coordinator.TaskDone", &taskDone, &taskDone)
+	//log.Printf("WORKER: finished MAP on %s", filename)
+	w.ready()
 }
 
-func (w *WorkerState) workerBusy() {
+func (w *WorkerState) busy(state string) {
 	w.Lock()
-	w.state = WORKER_BUSY
+	w.state = state
 	w.Unlock()
 }
 
-func (w *WorkerState) workerReady() {
+func (w *WorkerState) ready() {
 	w.Lock()
 	w.state = WORKER_READY
 	w.Unlock()
 }
 
 func (w *WorkerState) reduce(reduceId int, reducef func(string, []string) string) {
-	w.workerBusy()
+	w.busy(WORKER_REDUCE)
+
+	//log.Printf("Starting reduce task #%d", reduceId)
 
 	reduceIdS := strconv.Itoa(reduceId)
-	filenames := fileNamesWithSuffix(reduceIdS)
+	filenames := fileNamesWithSuffix(reduceIdS + ".json")
 
-	kvs := make(map[string][]string)
+	kvs_map := make(map[string][]string)
 	for _, filename := range filenames {
+		//log.Printf("opening reduce file %v", filename)
 		file, err := os.Open(filename)
 		if err != nil {
 			log.Fatalf("cannot read %v", filename)
 		}
 		dec := json.NewDecoder(file)
 		for {
-			var kv KeyValue
-			if err := dec.Decode(&kv); err != nil {
+			var kvs []KeyValue
+			if err := dec.Decode(&kvs); err != nil {
 				break
 			}
-			kvs[kv.Key] = append(kvs[kv.Key], kv.Value)
+			for _, kv := range kvs {
+				kvs_map[kv.Key] = append(kvs_map[kv.Key], kv.Value)
+			}
 		}
+		file.Close()
 	}
 
-	ofile, _ := os.Create("mr-out-" + reduceIdS)
-	//TODO: remove the multiple calls to Fprintf
-	for k, v := range kvs {
-		fmt.Fprintf(ofile, "%v %v\n", k, reducef(k, v))
+	ofile, _ := os.Create("mr-out-" + reduceIdS + ".txt")
+	defer ofile.Close()
+	for k, vs := range kvs_map {
+		fmt.Fprintf(ofile, "%v %v\n", k, reducef(k, vs))
 	}
-	ofile.Close()
-
-	w.workerReady()
+	taskDone := TaskDone{w.id, WORKER_REDUCE}
+	call("Coordinator.TaskDone", &taskDone, &taskDone)
+	//log.Printf("Finished reduce task #%d", reduceId)
+	w.ready()
 }
 
-func register() string {
+func register() RegisterWorkerReply {
 	reply := RegisterWorkerReply{}
 	call("Coordinator.RegisterWorker", RegisterWorker{"ready"}, &reply)
-	return reply.WorkerId
+	return reply
 }
 
 func fileNamesWithSuffix(suffix string) []string {
 	var filenames []string
+	files, err := ioutil.ReadDir(".")
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, file := range files {
+		if strings.HasSuffix(file.Name(), suffix) && !file.IsDir() {
+			filenames = append(filenames, file.Name())
+		}
+	}
 	return filenames
 }
 
@@ -156,27 +181,6 @@ func (w *WorkerState) heartBeat() HeartBeatReply {
 	call("Coordinator.WorkerHeartBeat", &args, &reply)
 	w.Unlock()
 	return reply
-}
-
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-func CallExample() {
-
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	call("Coordinator.Example", &args, &reply)
-
-	// reply.Y should be 100.
-	fmt.Printf("reply.Y %v\n", reply.Y)
 }
 
 // send an RPC request to the coordinator, wait for the response.

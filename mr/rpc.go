@@ -6,8 +6,10 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+)
 
 //
 // example to show how to declare the arguments
@@ -23,8 +25,9 @@ type ExampleReply struct {
 }
 
 const (
-	WORKER_READY string = "ready"
-	WORKER_BUSY  string = "busy"
+	WORKER_READY  string = "ready"
+	WORKER_MAP    string = "MAP"
+	WORKER_REDUCE string = "REDUCE"
 )
 
 // register worker
@@ -33,7 +36,14 @@ type RegisterWorker struct {
 }
 
 type RegisterWorkerReply struct {
+	WorkerId    string
+	MaxReduceId int // needed in map to know which reduce file to write to
+}
+
+// task finished
+type TaskDone struct {
 	WorkerId string
+	Task     string
 }
 
 // worker state (basically heartbeat)
@@ -45,8 +55,8 @@ type HeartBeat struct {
 type HeartBeatReply struct {
 	ShouldTerminate bool // if true then filenames is ignored
 	IsMap           bool // map or reduce.
+	IsReduce        bool
 	Filename        string
-	MaxReduceId     int // needed in map to know which reduce file to write to
 	ReduceId        int
 }
 
